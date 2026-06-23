@@ -30,7 +30,14 @@
  * 1. 个体编码：使用连续值[0,1]表示每个物品的"选择倾向"
  * 2. 解码方式：倾向值>=0.5表示选择该物品，<0.5表示不选择
  * 3. 约束处理：使用惩罚函数法，超重的解会被施加惩罚
- * 
+ *
+ * 关于"实数编码 + 阈值解码"的两点说明（便于理解本方法的本质）：
+ * - 这是用连续优化器求解二进制问题最常用的桥接手段：DE始终在连续的
+ *   [0,1]^n空间中搜索，仅在"评估适应度"时临时解码成0-1方案。
+ * - 该编码是"多对一"映射：例如0.51与0.99解码后同为选择(1)，因此多个
+ *   不同的连续个体可能对应同一个0-1方案，搜索空间中存在大量"平台区"。
+ *   这是此类方法的固有特性，并非缺陷。
+ *
  * 算法流程：
  * 1. 初始化种群（每个个体是一个[0,1]^n的连续向量）
  * 2. 解码为0-1方案并评估适应度
@@ -116,30 +123,34 @@ void decode_solution(double *continuous, int *binary) {
  */
 double objective_function(double *x) {
     int binary[N_ITEMS];
-    decode_solution(x, binary);
-    
+    decode_solution(x, binary);     // 第1步：连续编码 -> 0-1选择方案
+
     int total_weight = 0;
     int total_value = 0;
-    
-    // 计算总重量和总价值
+
+    // 第2步：累加被选中物品(binary[i]==1)的重量与价值
     for (int i = 0; i < N_ITEMS; i++) {
         if (binary[i] == 1) {
             total_weight += weights[i];
             total_value += values[i];
         }
     }
-    
-    // 计算适应度（带惩罚）
+
+    // 第3步：计算适应度（采用"惩罚函数法"处理容量约束）
+    // 说明：DE是最小化算法，而背包要"最大化价值"，因此统一返回"负价值"，
+    //       使得价值越高 -> 适应度越小 -> 越受DE青睐。
     double fitness;
     if (total_weight <= CAPACITY) {
-        // 可行解：返回负价值（因为DE求最小值，我们要最大化价值）
+        // 可行解（未超重）：适应度 = -总价值
         fitness = -total_value;
     } else {
-        // 不可行解：施加惩罚
+        // 不可行解（超重）：在负价值基础上叠加正的惩罚项 PENALTY*超重量。
+        // PENALTY取得足够大(1000)，使任何超重解的适应度都明显劣于可行解，
+        // 从而把搜索"推回"可行域；超重越多惩罚越重，提供了改进的梯度方向。
         int overweight = total_weight - CAPACITY;
         fitness = -total_value + PENALTY * overweight;
     }
-    
+
     return fitness;
 }
 
@@ -220,15 +231,15 @@ void print_solution(double *solution) {
  * 实现完整的差分进化算法流程，求解0-1背包问题
  */
 void differential_evolution() {
-    double population[POP_SIZE][DIM];
-    double fitness[POP_SIZE];
-    double trial[DIM];
-    double best_solution[DIM];
-    double best_fitness = INFINITY;
-    
+    double population[POP_SIZE][DIM];     // 当前种群：POP_SIZE个个体，每个个体是[0,1]^DIM的连续向量
+    double fitness[POP_SIZE];             // 各个体的适应度（已解码并带惩罚的目标函数值），缓存避免重复计算
+    double trial[DIM];                    // 试验向量：每次变异+交叉后产生的候选个体（连续编码）
+    double best_solution[DIM];            // 迄今为止找到的全局最优个体（连续编码，输出时再解码为0-1方案）
+    double best_fitness = INFINITY;       // 全局最优适应度，初始化为正无穷以便被任意真实值更新
+
     // 早停机制相关变量
-    int no_improve_count = 0;
-    double prev_best_fitness = INFINITY;
+    int no_improve_count = 0;             // 连续无改进的代数计数器
+    double prev_best_fitness = INFINITY;  // 上一代的最优适应度，用于判断本代是否取得改进
     
     // ========================================
     // 步骤1：初始化种群
@@ -236,63 +247,74 @@ void differential_evolution() {
     initialize_population(population);
     
     // ========================================
-    // 步骤2：计算初始适应度
+    // 步骤2：计算初始适应度，并找出初始全局最优
     // ========================================
+    // objective_function内部会先解码(连续->0-1)，再计算带惩罚的适应度
     for (int i = 0; i < POP_SIZE; i++) {
         fitness[i] = objective_function(population[i]);
-        if (fitness[i] < best_fitness) {
+        if (fitness[i] < best_fitness) {        // 适应度越小越好（价值越高/越不超重）
             best_fitness = fitness[i];
             for (int j = 0; j < DIM; j++) {
                 best_solution[j] = population[i][j];
             }
         }
     }
-    
+
+    // best_fitness是"负价值"，取负还原为正的价值用于展示
     printf("初始最优价值: %d\n\n", (int)(-best_fitness));
-    
+
     // ========================================
     // 步骤3：主循环 - 迭代进化
     // ========================================
     for (int gen = 0; gen < MAX_GEN; gen++) {
+        // 记录本代开始前的最优值，供代末早停判断使用
         prev_best_fitness = best_fitness;
-        
-        // 对每个个体进行进化操作
+
+        // 依次对种群中每个个体（目标向量target vector）执行：变异->交叉->选择
         for (int i = 0; i < POP_SIZE; i++) {
             // ========================================
             // 变异操作：DE/rand/1策略
             // ========================================
+            // 随机挑选三个互异、且都不等于当前个体i的下标r1、r2、r3，
+            // 以X_r1为基向量，X_r2与X_r3之差构成扰动方向（差分向量）。
             int r1, r2, r3;
             do { r1 = rand() % POP_SIZE; } while (r1 == i);
             do { r2 = rand() % POP_SIZE; } while (r2 == i || r2 == r1);
             do { r3 = rand() % POP_SIZE; } while (r3 == i || r3 == r1 || r3 == r2);
-            
+
             // ========================================
-            // 交叉操作：二项式交叉
+            // 交叉操作：二项式交叉(binomial)，与变异合并执行
             // ========================================
+            // j_rand为强制变异维度，保证trial至少有一维来自变异向量，
+            // 避免trial与目标向量X_i完全相同而使选择失去意义。
             int j_rand = rand() % DIM;
             for (int j = 0; j < DIM; j++) {
+                // 以交叉概率CR、或在强制维度j_rand上，采用变异值；否则继承目标个体
                 if (rand_double() < CR || j == j_rand) {
+                    // 变异公式：V[j] = X_r1[j] + F*(X_r2[j] - X_r3[j])
+                    // F为缩放因子，控制扰动步长大小
                     trial[j] = population[r1][j] + F * (population[r2][j] - population[r3][j]);
-                    
-                    // 边界处理：确保在[0,1]范围内
+
+                    // 边界处理：个体语义是"选择倾向"，必须保持在[0,1]内，越界则裁剪
                     if (trial[j] < 0.0) trial[j] = 0.0;
                     if (trial[j] > 1.0) trial[j] = 1.0;
                 } else {
-                    trial[j] = population[i][j];
+                    trial[j] = population[i][j];   // 该维度不交叉，保留目标个体的原值
                 }
             }
-            
+
             // ========================================
-            // 选择操作：贪婪选择
+            // 选择操作：贪婪选择（优胜劣汰）
             // ========================================
+            // 评估试验向量：内部会解码为0-1方案，可行则记负价值，超重则额外加惩罚
             double trial_fitness = objective_function(trial);
-            if (trial_fitness < fitness[i]) {
+            if (trial_fitness < fitness[i]) {       // trial不劣于目标个体才替换，保证种群单调改善
                 for (int j = 0; j < DIM; j++) {
                     population[i][j] = trial[j];
                 }
                 fitness[i] = trial_fitness;
-                
-                // 更新全局最优
+
+                // 更新全局最优：若产生了历史最好的解则记录下来
                 if (trial_fitness < best_fitness) {
                     best_fitness = trial_fitness;
                     for (int j = 0; j < DIM; j++) {

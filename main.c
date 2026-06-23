@@ -103,13 +103,23 @@ void initialize_population(double pop[][DIM]) {
     }
 }
 
-// 差分进化算法主函数
+/*
+ * ========================================
+ * 差分进化算法主函数
+ * ========================================
+ * 完整流程：
+ *   1. 初始化：随机生成初始种群，并计算每个个体的适应度
+ *   2. 进化循环（重复MAX_GEN代）：对每个个体依次执行
+ *        变异(Mutation) -> 交叉(Crossover) -> 选择(Selection)
+ *   3. 终止：达到最大代数，或触发早停机制后结束
+ *   4. 输出找到的最优解及其目标函数值
+ */
 void differential_evolution() {
-    double population[POP_SIZE][DIM];
-    double fitness[POP_SIZE];
-    double trial[DIM];
-    double best_solution[DIM];
-    double best_fitness = INFINITY;
+    double population[POP_SIZE][DIM];     // 当前种群：POP_SIZE个个体，每个个体DIM维
+    double fitness[POP_SIZE];             // 各个体对应的适应度（目标函数值），缓存以避免重复计算
+    double trial[DIM];                    // 试验向量：每次变异+交叉后产生的候选解
+    double best_solution[DIM];            // 迄今为止找到的全局最优解
+    double best_fitness = INFINITY;       // 全局最优适应度，初始化为正无穷便于后续被任何真实值更新
     
     // ========================================
     // 早停机制相关变量
@@ -117,56 +127,85 @@ void differential_evolution() {
     int no_improve_count = 0;             // 记录连续无改进的代数
     double prev_best_fitness = INFINITY;  // 记录上一代的最优值，用于判断是否有改进
     
-    // 初始化种群
+    // ========================================
+    // 步骤1：初始化种群
+    // ========================================
+    // 在搜索空间内随机撒点，作为算法的搜索起点
     initialize_population(population);
-    
-    // 计算初始适应度
+
+    // 计算初始种群中每个个体的适应度，并从中找出初始全局最优
     for (int i = 0; i < POP_SIZE; i++) {
         fitness[i] = objective_function(population[i]);
-        if (fitness[i] < best_fitness) {
+        if (fitness[i] < best_fitness) {        // 记录当前最优（求最小值问题）
             best_fitness = fitness[i];
             for (int j = 0; j < DIM; j++) {
                 best_solution[j] = population[i][j];
             }
         }
     }
-    
+
     printf("初始最优值: %.6f\n\n", best_fitness);
-    
-    // 主循环
+
+    // ========================================
+    // 步骤2：进化主循环，每次迭代称为"一代"(generation)
+    // ========================================
     for (int gen = 0; gen < MAX_GEN; gen++) {
-        // 记录本代开始前的最优值
+        // 记录本代开始前的最优值，用于代末判断本代是否取得改进（供早停机制使用）
         prev_best_fitness = best_fitness;
         
+        // 依次对种群中的每一个个体（称为"目标向量"target vector）进行进化
         for (int i = 0; i < POP_SIZE; i++) {
-            // 随机选择三个不同的个体
+            // ----------------------------------------
+            // 准备工作：随机选择三个互不相同、且都不等于当前个体i的个体
+            // ----------------------------------------
+            // 原理：变异需要 X_r1、X_r2、X_r3 三个不同个体。
+            //   - 三者互异，才能保证差分向量(X_r2 - X_r3)非零，从而产生有效扰动
+            //   - 都不等于i，避免变异结果退化、保持种群多样性
+            // do-while循环用于不断重抽，直到抽到满足"互异"条件的下标为止
             int r1, r2, r3;
             do { r1 = rand() % POP_SIZE; } while (r1 == i);
             do { r2 = rand() % POP_SIZE; } while (r2 == i || r2 == r1);
             do { r3 = rand() % POP_SIZE; } while (r3 == i || r3 == r1 || r3 == r2);
-            
-            // 变异操作
+
+            // ----------------------------------------
+            // 变异(Mutation) + 交叉(Crossover) 合并执行，生成试验向量trial
+            // ----------------------------------------
+            // j_rand：随机选定的一个"强制变异维度"。
+            //   作用是保证trial至少有一个维度来自变异向量，
+            //   从而确保trial与目标向量X_i不会完全相同（否则选择操作毫无意义）。
             int j_rand = rand() % DIM;
             for (int j = 0; j < DIM; j++) {
+                // 交叉决策：满足以下任一条件时，该维度取"变异值"
+                //   (1) 随机数 < CR：以交叉概率CR接受变异（CR越大，trial越像变异向量）
+                //   (2) j == j_rand：强制变异维度，保证至少有一维被改变
                 if (rand_double() < CR || j == j_rand) {
+                    // 变异公式（DE/rand/1）：以X_r1为基，叠加F倍的差分向量(X_r2 - X_r3)
+                    //   F为缩放因子，控制扰动步长：F越大探索范围越广，越小越偏向局部精细搜索
                     trial[j] = population[r1][j] + F * (population[r2][j] - population[r3][j]);
-                    // 边界处理
+                    // 边界处理：变异结果可能越界，将其裁剪回搜索空间[LOWER_BOUND, UPPER_BOUND]
                     if (trial[j] < LOWER_BOUND) trial[j] = LOWER_BOUND;
                     if (trial[j] > UPPER_BOUND) trial[j] = UPPER_BOUND;
                 } else {
+                    // 不交叉的维度：直接继承目标向量X_i的对应分量，保留原有信息
                     trial[j] = population[i][j];
                 }
             }
-            
-            // 选择操作
+
+            // ----------------------------------------
+            // 选择(Selection)：贪婪选择，优胜劣汰
+            // ----------------------------------------
+            // 比较试验向量与目标向量的适应度（本例为求最小值）：
+            //   - 若trial更优(更小)，则用trial替换种群中的第i个个体
+            //   - 否则保留原个体不变
+            // 这种"只接受更优解"的策略保证了种群质量单调不退化（精英保留思想）
             double trial_fitness = objective_function(trial);
             if (trial_fitness < fitness[i]) {
                 for (int j = 0; j < DIM; j++) {
-                    population[i][j] = trial[j];
+                    population[i][j] = trial[j];   // 用更优的试验向量替换目标个体
                 }
-                fitness[i] = trial_fitness;
-                
-                // 更新全局最优
+                fitness[i] = trial_fitness;        // 同步更新该个体的适应度
+
+                // 更新全局最优：如果新个体优于历史最优，则记录下来
                 if (trial_fitness < best_fitness) {
                     best_fitness = trial_fitness;
                     for (int j = 0; j < DIM; j++) {
